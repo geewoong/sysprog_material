@@ -43,18 +43,30 @@ static ssize_t gpio_fops_read(struct file *filp, char __user *buf, size_t len, l
 
 static ssize_t gpio_fops_write(struct file *filp, const char __user *buf, size_t len, loff_t *off) {
     struct gpio_entry *entry = filp->private_data;
-    char kbuf;
-    if (len < 1) return -EINVAL;
-    if (copy_from_user(&kbuf, buf, 1)) return -EFAULT;
-    if (gpiod_get_direction(entry->desc)) return -EPERM;
+    char kbuf[8] = {0};
 
-    if (kbuf == '1') gpiod_set_value(entry->desc, 1);
-    else if (kbuf == '0') gpiod_set_value(entry->desc, 0);
-    else return -EINVAL;
+    if (len >= sizeof(kbuf))
+        return -EINVAL;
+    if (copy_from_user(kbuf, buf, len))
+        return -EFAULT;
+    kbuf[len] = '\0'; // Null-terminate for safety
 
-    return 1;
+    if (sysfs_streq(kbuf, "1")) {
+        if (gpiod_get_direction(entry->desc)) return -EPERM;
+        gpiod_set_value(entry->desc, 1);
+    } else if (sysfs_streq(kbuf, "0")) {
+        if (gpiod_get_direction(entry->desc)) return -EPERM;
+        gpiod_set_value(entry->desc, 0);
+    } else if (sysfs_streq(kbuf, "in")) {
+        gpiod_direction_input(entry->desc);
+    } else if (sysfs_streq(kbuf, "out")) {
+        gpiod_direction_output(entry->desc, 0);
+    } else {
+        return -EINVAL;
+    }
+
+    return len;
 }
-
 static int gpio_fops_open(struct inode *inode, struct file *filp) {
     int minor = iminor(inode);
     if (minor >= MAX_GPIO || !gpio_table[minor])
