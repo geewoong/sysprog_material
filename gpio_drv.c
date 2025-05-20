@@ -6,10 +6,18 @@
 #include <linux/uaccess.h>
 #include <linux/slab.h>
 #include <linux/cdev.h>
+#include <linux/interrupt.h>
+#include <linux/fcntl.h>
+#include <linux/signal.h>
+#include <linux/poll.h>
 
 #define CLASS_NAME "sysprog_gpio"
 #define MAX_GPIO 10
-#define GPIOCHIP_BASE 512  // BCM 0 = internal 512
+#define GPIOCHIP_BASE 512
+
+#define GPIO_IOCTL_MAGIC       'G'
+#define GPIO_IOCTL_ENABLE_IRQ  _IOW(GPIO_IOCTL_MAGIC, 1, int)
+#define GPIO_IOCTL_DISABLE_IRQ _IOW(GPIO_IOCTL_MAGIC, 2, int)
 
 static dev_t dev_num_base;
 static struct cdev gpio_cdev;
@@ -19,6 +27,9 @@ struct gpio_entry {
     int bcm_num;
     struct gpio_desc *desc;
     struct device *dev;
+    int irq_num;
+    bool irq_enabled;
+    struct fasync_struct *async_queue;
 };
 
 static struct class *gpiod_class;
@@ -30,6 +41,67 @@ static int find_gpio_index(int bcm) {
             return i;
     }
     return -1;
+}
+
+static irqreturn_t gpio_irq_handler(int irq, void *dev_id) {
+    struct gpio_entry *entry = dev_id;
+    pr_info("[sysprog_gpio] IRQ on GPIO %d\n", entry->bcm_num);
+    if (entry->async_queue)
+        kill_fasync(&entry->async_queue, SIGIO, POLL_IN);
+    return IRQ_HANDLED;
+}
+
+static int gpio_fops_open(struct inode *inode, struct file *filp) {
+    int minor = iminor(inode);
+    if (minor >= MAX_GPIO || !gpio_table[minor])
+        return -ENODEV;
+    filp->private_data = gpio_table[minor];
+    return 0;
+}
+
+static int gpio_fops_release(struct inode *inode, struct file *filp) {
+    struct gpio_entry *entry = filp->private_data;
+    if (entry && entry->irq_enabled) {
+        free_irq(entry->irq_num, entry);
+        entry->irq_enabled = false;
+    }
+    fasync_helper(-1, filp, 0, &entry->async_queue);
+    return 0;
+}
+
+static int gpio_fops_fasync(int fd, struct file *filp, int mode) {
+    struct gpio_entry *entry = filp->private_data;
+    return fasync_helper(fd, filp, mode, &entry->async_queue);
+}
+
+static long gpio_fops_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
+    struct gpio_entry *entry = filp->private_data;
+    int irq;
+
+    switch (cmd) {
+    case GPIO_IOCTL_ENABLE_IRQ:
+        if (entry->irq_enabled)
+            return -EBUSY;
+        irq = gpiod_to_irq(entry->desc);
+        if (irq < 0) return -EINVAL;
+        if (request_irq(irq, gpio_irq_handler,
+                        IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
+                        "gpio_irq", entry)) {
+            pr_err("[sysprog_gpio] IRQ request failed\n");
+            return -EIO;
+        }
+        entry->irq_num = irq;
+        entry->irq_enabled = true;
+        return 0;
+    case GPIO_IOCTL_DISABLE_IRQ:
+        if (!entry->irq_enabled)
+            return -EINVAL;
+        free_irq(entry->irq_num, entry);
+        entry->irq_enabled = false;
+        return 0;
+    default:
+        return -ENOTTY;
+    }
 }
 
 static ssize_t gpio_fops_read(struct file *filp, char __user *buf, size_t len, loff_t *off) {
@@ -44,13 +116,9 @@ static ssize_t gpio_fops_read(struct file *filp, char __user *buf, size_t len, l
 static ssize_t gpio_fops_write(struct file *filp, const char __user *buf, size_t len, loff_t *off) {
     struct gpio_entry *entry = filp->private_data;
     char kbuf[8] = {0};
-
-    if (len >= sizeof(kbuf))
-        return -EINVAL;
-    if (copy_from_user(kbuf, buf, len))
-        return -EFAULT;
-    kbuf[len] = '\0'; // Null-terminate for safety
-
+    if (len >= sizeof(kbuf)) return -EINVAL;
+    if (copy_from_user(kbuf, buf, len)) return -EFAULT;
+    kbuf[len] = '\0';
     if (sysfs_streq(kbuf, "1")) {
         if (gpiod_get_direction(entry->desc)) return -EPERM;
         gpiod_set_value(entry->desc, 1);
@@ -64,19 +132,7 @@ static ssize_t gpio_fops_write(struct file *filp, const char __user *buf, size_t
     } else {
         return -EINVAL;
     }
-
     return len;
-}
-static int gpio_fops_open(struct inode *inode, struct file *filp) {
-    int minor = iminor(inode);
-    if (minor >= MAX_GPIO || !gpio_table[minor])
-        return -ENODEV;
-    filp->private_data = gpio_table[minor];
-    return 0;
-}
-
-static int gpio_fops_release(struct inode *inode, struct file *filp) {
-    return 0;
 }
 
 static const struct file_operations gpio_fops = {
@@ -85,6 +141,8 @@ static const struct file_operations gpio_fops = {
     .read = gpio_fops_read,
     .write = gpio_fops_write,
     .release = gpio_fops_release,
+    .fasync = gpio_fops_fasync,
+    .unlocked_ioctl = gpio_fops_ioctl,
 };
 
 static ssize_t value_show(struct device *dev, struct device_attribute *attr, char *buf) {
