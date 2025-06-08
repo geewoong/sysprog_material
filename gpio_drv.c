@@ -107,11 +107,13 @@ static long gpio_fops_ioctl(struct file *filp, unsigned int cmd, unsigned long a
 static ssize_t gpio_fops_read(struct file *filp, char __user *buf, size_t len, loff_t *off) {
     struct gpio_entry *entry = filp->private_data;
     char val = gpiod_get_value(entry->desc) ? '1' : '0';
-    if (*off != 0) return 0;
-    if (copy_to_user(buf, &val, 1)) return -EFAULT;
-    *off = 1;
+
+    if (copy_to_user(buf, &val, 1))
+        return -EFAULT;
+
     return 1;
 }
+
 
 static ssize_t gpio_fops_write(struct file *filp, const char __user *buf, size_t len, loff_t *off) {
     struct gpio_entry *entry = filp->private_data;
